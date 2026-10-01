@@ -1,0 +1,27 @@
+# --------- pytorch --------- #
+torch>=2.0.0
+torchvision>=0.15.0
+lightning>=2.0.0
+torchmetrics>=0.11.4
+timm>=0.9.0  # for Vision Transformer models
+transformers  # Hugging Face transformers for pretrained models
+
+# --------- hydra --------- #
+hydra-core==1.3.2
+hydra-colorlog==1.2.0
+hydra-optuna-sweeper==1.2.0
+
+# --------- loggers --------- #
+wandb
+
+# --------- others --------- #
+rootutils       # standardizing the project root setup
+pre-commit      # hooks for applying linters on commit
+rich            # beautiful text formatting in terminal
+pytest          # tests
+ipdb            # interactive python debugger
+opencv-python   # computer vision library (cv2)
+fvcore          # Facebook research core library for FLOP analysis
+einops          # tensor operations
+tqdm            # progress bar
+# sh            # for running bash commands in some tests (linux/macos only)

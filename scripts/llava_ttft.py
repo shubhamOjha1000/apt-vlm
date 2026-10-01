@@ -74,9 +74,9 @@ class Pipeline:
         out = self.vision(pixel_values, output_hidden_states=True)
         return out.hidden_states[self.layer][0, 1:]
 
-    def encode_apt(self, net, tokenizer, pixel_values):
+    def encode_apt(self, net, tokenizer, pixel_values, input_dict=None):
         keep = len(net.blocks) + 1 + self.layer if self.layer < 0 else self.layer
-        return apt_hidden_states(self, net, tokenizer, pixel_values, {keep})[keep]
+        return apt_hidden_states(self, net, tokenizer, pixel_values, {keep}, input_dict)[keep]
 
     def splice(self, input_ids, image_feats):
         """Prompt embeddings with the image-token run replaced by `image_feats` (any length)."""
@@ -113,13 +113,16 @@ class Pipeline:
         return out[0]
 
 
-def apt_hidden_states(pipe, net, tokenizer, pixel_values, keep):
+def apt_hidden_states(pipe, net, tokenizer, pixel_values, keep, input_dict=None):
     """APT image features (CLS dropped, raster order) after h blocks, for each h in `keep`.
     h = 0 is right after the pre-norm, matching HF CLIP's hidden_states[h].
-    Every block is run, like LLaVA's own encoder, so both sides do the same number of layers."""
+    Every block is run, like LLaVA's own encoder, so both sides do the same number of layers.
+    Patch sizes come from entropy unless a ready-made tokenizer output `input_dict` is given."""
     t0 = sync()
-    maps = tokenizer.compute_importance_maps(pixel_values.float())
-    d = tokenizer(pixel_values, importance_maps=maps)
+    if input_dict is None:
+        maps = tokenizer.compute_importance_maps(pixel_values.float())
+        input_dict = tokenizer(pixel_values, importance_maps=maps)
+    d = input_dict
     pipe.tokenize_time = sync() - t0
     x, cu_seqlens, max_seqlen, _, _ = net.mixed_patch(pixel_values, net.pos_embed, d)
     x = net.norm_pre(x)
@@ -203,17 +206,12 @@ def raster_order(d, tokenizer):
     return torch.cat(keys).argsort()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--load-4bit", action="store_true", help="4-bit LLM (vision tower and projector stay fp16)")
-    ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--repeats", type=int, default=10)
-    args = ap.parse_args()
-
+def load_llava(load_4bit=False, device="cuda"):
+    """LLaVA-1.5-7B (eager attention) + processor + Pipeline whose vision encoder is full fp16 CLIP.
+    The LLM is 4-bit if asked or if the GPU has < 20 GB."""
     assert torch.cuda.is_available(), "needs a GPU runtime"
-    device = "cuda"
     gpu = torch.cuda.get_device_properties(0)
-    load_4bit = args.load_4bit or gpu.total_memory < 20 * 2 ** 30
+    load_4bit = load_4bit or gpu.total_memory < 20 * 2 ** 30
     print(f"GPU={gpu.name} ({gpu.total_memory / 2 ** 30:.0f} GB)  LLM={'4-bit' if load_4bit else 'fp16'}  "
           f"attention=eager (LLaVA) / {vit_components.ATTN_IMPL} (APT)  "
           f"torch={torch.__version__} transformers={transformers.__version__} timm={timm.__version__}")
@@ -238,6 +236,17 @@ def main():
         pipe.vision = CLIPVisionModel.from_pretrained(
             CLIP_ID, torch_dtype=torch.float16, attn_implementation="eager").to(device).eval()
         assert is_plain_fp16(pipe.vision)
+    return model, processor, pipe
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--load-4bit", action="store_true", help="4-bit LLM (vision tower and projector stay fp16)")
+    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--repeats", type=int, default=10)
+    args = ap.parse_args()
+    device = "cuda"
+    model, processor, pipe = load_llava(args.load_4bit, device)
 
     images = load_images()
     names = list(images)

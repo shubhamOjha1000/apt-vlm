@@ -76,7 +76,8 @@ def reference_layout(cfg, gaze_uv):
 # Step 1 --------------------------------------------------------------------------------------
 @pytest.mark.parametrize("p", [14, 16])
 def test_base_patch_size_comes_from_encoder(p):
-    net = VisionTransformer(img_size=224, patch_size=p, embed_dim=DIM, depth=1, num_heads=2, num_classes=0)
+    net = VisionTransformer(img_size=224, patch_size=p, embed_dim=DIM, depth=1, num_heads=2, num_classes=0,
+                            weight_init="skip")  # the repo's default init path is broken (named_apply not imported)
     assert base_patch_size(net) == p
     assert FoveaConfig.for_encoder(make_net(), img_size=IMG).p == P
 
@@ -90,7 +91,7 @@ def test_scale_ladder():
     with pytest.raises(ValueError, match="multiple of the largest patch 56"):
         scale_ladder(14, 3, 300)
     with pytest.raises(ValueError):
-        FoveaConfig(img_size=224, num_scales=3)  # 224 is not a multiple of 56
+        FoveaConfig(img_size=300, num_scales=3)  # 300 is not a multiple of 56
 
 
 # Step 3 --------------------------------------------------------------------------------------
@@ -136,7 +137,7 @@ def test_eccentricity_pinhole():
     # Zero at the gaze point wherever it is; symmetric in the two points.
     for g in GAZES:
         gx, gy = g[0] * IMG, g[1] * IMG
-        assert ecc_at(cfg, g, gx, gy) == pytest.approx(0, abs=1e-6)
+        assert ecc_at(cfg, g, gx, gy) == pytest.approx(0, abs=1e-4)  # float32 gaze pixel rounding
         assert ecc_at(cfg, g, 30, 200) == pytest.approx(ecc_at(cfg, (30 / IMG, 200 / IMG), gx, gy), abs=1e-4)
 
 

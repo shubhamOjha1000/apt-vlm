@@ -1,12 +1,37 @@
+import os
 from typing import Optional, Type, Final
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 from timm.layers import Mlp, DropPath, use_fused_attn
-from flash_attn import flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
 
 import ipdb
+
+# Attention backend: "eager" (plain matmul + softmax, runs anywhere) or "flash" (needs flash-attn).
+ATTN_IMPL = os.environ.get("APT_ATTN_IMPL", "eager")
+
+
+def eager_attention(q, k, v, scale, attn_mask=None, dropout_p=0.):
+    """q, k, v: (B, num_heads, N, head_dim). attn_mask: bool (N, N), True = may attend."""
+    attn = (q * scale) @ k.transpose(-2, -1)
+    if attn_mask is not None:
+        attn = attn.masked_fill(~attn_mask, float("-inf"))
+    attn = attn.softmax(dim=-1)
+    if dropout_p > 0.:
+        attn = F.dropout(attn, p=dropout_p)
+    return attn @ v
+
+
+def block_diagonal_mask(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Bool (N, N) mask so tokens only attend within their own packed sequence."""
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    seq_ids = torch.repeat_interleave(torch.arange(len(seqlens), device=cu_seqlens.device), seqlens)
+    return seq_ids[:, None] == seq_ids[None, :]
 
 def use_fused_attn():
     return hasattr(torch.nn.functional, 'scaled_dot_product_attention') and not torch.backends.mps.is_available()
@@ -42,7 +67,16 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
 
-        if cu_seqlens is not None and max_seqlen is not None:
+        if ATTN_IMPL == "eager":
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            q, k = self.q_norm(q), self.k_norm(k)
+            attn_mask = block_diagonal_mask(cu_seqlens) if cu_seqlens is not None else None
+            out = eager_attention(
+                q, k, v, self.scale, attn_mask,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            ).transpose(1, 2).reshape(B, N, C)
+        elif cu_seqlens is not None and max_seqlen is not None:
             # Flash attention varlen path
             qkv = qkv.permute(2, 0, 1, 3, 4)  # [3, B, N, num_heads, head_dim]
             q, k, v = qkv.unbind(0)

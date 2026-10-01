@@ -7,7 +7,10 @@ from torch import Tensor
 from torchvision import tv_tensors
 from torchvision.transforms import v2
 
-from flash_attn import flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
 
 
 

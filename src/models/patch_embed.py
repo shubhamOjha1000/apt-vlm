@@ -223,7 +223,7 @@ class PatchEmbed(nn.Module):
                 embed_scale = self.zero_conv(attn_scale) + embed_scale
                 
             # place in output based on size.
-            expanded_outputs[output_mask == (scale_idx+2)] = embed_scale.float()
+            expanded_outputs[output_mask == (scale_idx+2)] = embed_scale.to(expanded_outputs.dtype)
 
         expanded_outputs = expanded_outputs.unsqueeze(0).contiguous()
 
@@ -372,7 +372,7 @@ class TokenizedZeroConvPatchAttn(nn.Module):
                 embed_scale = self.zero_conv(attn_scale) + embed_scale + dummy_pos_embed
                 
             # place in output based on size.
-            expanded_outputs[output_mask == (scale_idx+2)] = embed_scale.float()
+            expanded_outputs[output_mask == (scale_idx+2)] = embed_scale.to(expanded_outputs.dtype)
 
         expanded_outputs = expanded_outputs.unsqueeze(0)
         output_rope = None

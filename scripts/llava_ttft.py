@@ -19,9 +19,11 @@ Usage (Colab):  python scripts/llava_ttft.py           # fp16 if the GPU has >= 
                 python scripts/llava_ttft.py --load-4bit
 """
 import argparse
+import copy
 import os
 import sys
 import time
+from functools import partial
 
 os.environ.setdefault("APT_ATTN_IMPL", "eager")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -29,16 +31,18 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import numpy as np
 import timm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import transformers
-from transformers import AutoProcessor, LlavaForConditionalGeneration
+from transformers import AutoProcessor, CLIPVisionModel, LlavaForConditionalGeneration
 
-from scripts.forward_check import (
-    APT_SETTINGS, IMAGE_URLS, TIMM_NAME, PATCH, IMG_SIZE, build_apt, build_tokenizer, load_images,
-)
+from scripts.forward_check import APT_SETTINGS, IMAGE_URLS, PATCH, IMG_SIZE, build_tokenizer, load_images
 from src.models import vit_components
+from src.models.patch_embed import TokenizedZeroConvPatchAttn
+from src.models.vision_transformer import VisionTransformer
 
 MODEL_ID = "llava-hf/llava-1.5-7b-hf"
+CLIP_ID = "openai/clip-vit-large-patch14-336"  # LLaVA-1.5 keeps this encoder frozen: same weights
 PROMPT = "USER: <image>\nDescribe this image in one sentence. ASSISTANT:"
 REAL_IMAGES = list(IMAGE_URLS)  # the synthetic gradient is reported but left out of the mean
 
@@ -71,22 +75,8 @@ class Pipeline:
         return out.hidden_states[self.layer][0, 1:]
 
     def encode_apt(self, net, tokenizer, pixel_values):
-        t0 = sync()
-        maps = tokenizer.compute_importance_maps(pixel_values.float())
-        d = tokenizer(pixel_values, importance_maps=maps)
-        self.tokenize_time = sync() - t0
-        x, cu_seqlens, max_seqlen, _, _ = net.mixed_patch(pixel_values, net.pos_embed, d)
-        x = net.norm_pre(x)
-        # hidden_states[h] = output after h blocks (h = 0 is after the pre-norm), as in HF CLIP.
-        # Run every block, like LLaVA's own encoder does, so both sides do the same number of layers.
         keep = len(net.blocks) + 1 + self.layer if self.layer < 0 else self.layer
-        feats = x if keep == 0 else None
-        for i, blk in enumerate(net.blocks):
-            x = blk(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-            if i + 1 == keep:
-                feats = x
-        feats = feats[0][d["output_mask"] != -1]
-        return feats[raster_order(d, tokenizer)]
+        return apt_hidden_states(self, net, tokenizer, pixel_values, {keep})[keep]
 
     def splice(self, input_ids, image_feats):
         """Prompt embeddings with the image-token run replaced by `image_feats` (any length)."""
@@ -121,6 +111,83 @@ class Pipeline:
             max_new_tokens=max_new_tokens, do_sample=False,
         )
         return out[0]
+
+
+def apt_hidden_states(pipe, net, tokenizer, pixel_values, keep):
+    """APT image features (CLS dropped, raster order) after h blocks, for each h in `keep`.
+    h = 0 is right after the pre-norm, matching HF CLIP's hidden_states[h].
+    Every block is run, like LLaVA's own encoder, so both sides do the same number of layers."""
+    t0 = sync()
+    maps = tokenizer.compute_importance_maps(pixel_values.float())
+    d = tokenizer(pixel_values, importance_maps=maps)
+    pipe.tokenize_time = sync() - t0
+    x, cu_seqlens, max_seqlen, _, _ = net.mixed_patch(pixel_values, net.pos_embed, d)
+    x = net.norm_pre(x)
+    is_image = d["output_mask"] != -1
+    order = raster_order(d, tokenizer)
+    out = {0: x[0][is_image][order]} if 0 in keep else {}
+    for i, blk in enumerate(net.blocks):
+        x = blk(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        if i + 1 in keep:
+            out[i + 1] = x[0][is_image][order]
+    return out
+
+
+def hf_hidden_states(vision, pixel_values):
+    """HF CLIP image features (CLS dropped) for every hidden state 0..depth."""
+    return [h[0, 1:] for h in vision(pixel_values, output_hidden_states=True).hidden_states]
+
+
+class QuickGELU(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(1.702 * x)
+
+
+def is_plain_fp16(module):
+    """True if no layer of `module` is quantized and every weight is fp16."""
+    linears = [m for m in module.modules() if isinstance(m, nn.Linear)]
+    return all(type(m) is nn.Linear for m in linears) and all(p.dtype == torch.float16 for p in module.parameters())
+
+
+def apt_from_hf_clip(vision, num_scales, thresholds, dtype=torch.float16):
+    """APT ViT carrying exactly the weights of an HF CLIPVisionModel (LLaVA's vision tower)."""
+    cfg = vision.config
+    assert cfg.hidden_act == "quick_gelu" and cfg.patch_size == PATCH and cfg.image_size == IMG_SIZE
+    sd = {k: v.detach().float().cpu() for k, v in vision.state_dict().items()}
+    anchor = "embeddings.patch_embedding.weight"
+    prefix = next(k for k in sd if k.endswith(anchor))[:-len(anchor)]
+    g = lambda k: sd[prefix + k]
+    D, L = cfg.hidden_size, cfg.num_hidden_layers
+
+    new = {
+        "patch_embed.proj.weight": g("embeddings.patch_embedding.weight"),
+        "cls_token": g("embeddings.class_embedding").view(1, 1, D),
+        "pos_embed": g("embeddings.position_embedding.weight").unsqueeze(0),
+        "norm_pre.weight": g("pre_layrnorm.weight"), "norm_pre.bias": g("pre_layrnorm.bias"),
+        "norm.weight": g("post_layernorm.weight"), "norm.bias": g("post_layernorm.bias"),
+    }
+    for i in range(L):
+        hf, apt = f"encoder.layers.{i}.", f"blocks.{i}."
+        for a, h in [("norm1", "layer_norm1"), ("norm2", "layer_norm2"), ("attn.proj", "self_attn.out_proj"),
+                     ("mlp.fc1", "mlp.fc1"), ("mlp.fc2", "mlp.fc2")]:
+            for t in ("weight", "bias"):
+                new[f"{apt}{a}.{t}"] = g(f"{hf}{h}.{t}")
+        for t in ("weight", "bias"):
+            new[f"{apt}attn.qkv.{t}"] = torch.cat([g(f"{hf}self_attn.{x}_proj.{t}") for x in "qkv"])
+
+    net = VisionTransformer(
+        img_size=IMG_SIZE, patch_size=PATCH, embed_dim=D, depth=L, num_heads=cfg.num_attention_heads,
+        mlp_ratio=cfg.intermediate_size / D, num_classes=0, pre_norm=True,
+        norm_layer=partial(nn.LayerNorm, eps=cfg.layer_norm_eps), act_layer=QuickGELU,
+        mixed_patch_embed=partial(TokenizedZeroConvPatchAttn, patch_size=PATCH),
+        num_scales=num_scales, thresholds=thresholds, weight_init="skip",
+    )
+    missing, unexpected = net.load_state_dict(new, strict=False)
+    bad_missing = [k for k in missing if not k.startswith("mixed_patch.")]
+    assert not bad_missing and not unexpected, f"weight mismatch: missing={bad_missing} unexpected={unexpected}"
+    net.init_multiscale_patch_embed()  # after loading, as in ViTLitModule
+    assert torch.count_nonzero(net.mixed_patch.zero_conv.weight) == 0
+    return net.to(vision.device, dtype).eval()
 
 
 def raster_order(d, tokenizer):
@@ -162,6 +229,16 @@ def main():
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     pipe = Pipeline(model)
 
+    # The vision encoder must be full fp16 CLIP for both pipelines. If 4-bit loading quantized it anyway,
+    # use a fresh fp16 copy of the same frozen OpenAI CLIP encoder instead.
+    if is_plain_fp16(pipe.vision):
+        print("vision encoder: LLaVA's own, fp16, not quantized")
+    else:
+        print("vision encoder: LLaVA's copy was quantized by the 4-bit load -> using fp16 " + CLIP_ID)
+        pipe.vision = CLIPVisionModel.from_pretrained(
+            CLIP_ID, torch_dtype=torch.float16, attn_implementation="eager").to(device).eval()
+        assert is_plain_fp16(pipe.vision)
+
     images = load_images()
     names = list(images)
     inputs = {}
@@ -170,35 +247,50 @@ def main():
         inputs[n] = (enc["input_ids"].to(device), enc["pixel_values"].to(device, torch.float16))
     assert inputs[names[0]][1].shape[-1] == IMG_SIZE
 
-    # APT encoders: OpenAI CLIP ViT-L/14-336 weights (the encoder LLaVA-1.5 uses), fp16.
-    ref = timm.create_model(TIMM_NAME, pretrained=True, num_classes=0).eval()
+    # APT encoders, built from the exact weights of the vision encoder above, fp16.
     apt = {}
     for setting, (num_scales, thresholds) in APT_SETTINGS.items():
-        net = build_apt(ref, num_scales, thresholds, "cpu").to(device, torch.float16)
-        apt[setting] = (net, build_tokenizer(num_scales, thresholds))
-    no_merge_tok = build_tokenizer(2, [-1.0])
-    no_merge_net = apt[next(iter(APT_SETTINGS))][0]  # 2-scale net, merging off via the tokenizer
-    del ref
+        apt[setting] = (apt_from_hf_clip(pipe.vision, num_scales, thresholds), build_tokenizer(num_scales, thresholds))
 
     encoders = {"Baseline": pipe.encode_baseline}
     for setting, (net, tok) in apt.items():
         encoders[setting] = (lambda net, tok: (lambda pv: pipe.encode_apt(net, tok, pv)))(net, tok)
 
-    # Sanity check: APT with merging off == LLaVA's own encoder.
-    print("\n=== Sanity check: APT with merging off vs LLaVA's own vision encoder ===")
-    no_merge = lambda pv: pipe.encode_apt(no_merge_net, no_merge_tok, pv)
+    # Sanity check: APT with merging off == LLaVA's vision encoder.
+    print("\n=== Sanity check: APT with merging off vs LLaVA's vision encoder ===")
+    print("Pass/fail is decided in fp32. The fp16 rows are for information: compare APT's fp16 error")
+    print("with LLaVA's own fp16-vs-fp32 error (last row); they should be about the same size.")
+    no_merge_tok = build_tokenizer(2, [-1.0])
+    net16 = apt[next(iter(APT_SETTINGS))][0]  # 2-scale net; merging is turned off by the tokenizer
+    net32 = apt_from_hf_clip(pipe.vision, 2, [-1.0], dtype=torch.float32)
+    vision32 = copy.deepcopy(pipe.vision).float()
+    no_merge = lambda pv: pipe.encode_apt(net16, no_merge_tok, pv)
+    depth = len(net16.blocks)
+    target = depth + 1 + pipe.layer if pipe.layer < 0 else pipe.layer  # 23: the layer LLaVA uses
+    show = sorted({0, 1, depth // 4, depth // 2, 3 * depth // 4, target, depth})
+    min_cos = lambda a, b: F.cosine_similarity(a.float(), b.float(), dim=-1).min().item()
+
     all_ok = True
     for n in REAL_IMAGES:
         ids, pv = inputs[n]
         with torch.inference_mode():
-            a, b = no_merge(pv).float(), pipe.encode_baseline(pv).float()
-        cos = F.cosine_similarity(a, b, dim=-1).min().item()
-        same = torch.equal(pipe.answer(no_merge, ids, pv), pipe.answer(pipe.encode_baseline, ids, pv))
-        ok = a.shape == b.shape == (576, 1024) and cos > 0.999
+            hf32 = hf_hidden_states(vision32, pv.float())
+            hf16 = hf_hidden_states(pipe.vision, pv)
+            apt32 = apt_hidden_states(pipe, net32, no_merge_tok, pv.float(), set(show))
+            apt16 = apt_hidden_states(pipe, net16, no_merge_tok, pv, set(show))
+        ok = apt32[target].shape == hf32[target].shape == (576, net16.embed_dim) \
+            and min_cos(apt32[target], hf32[target]) > 0.999
         all_ok &= ok
-        print(f"[{'ok' if ok else 'FAIL'}] {n:<18} tokens={a.shape[0]}  min cosine per token={cos:.5f}  "
-              f"rel. max diff={(a - b).abs().max().item() / b.abs().max().item():.1e}  same answer={same}")
-    assert all_ok, "APT with merging off does not reproduce LLaVA's vision features"
+        same = torch.equal(pipe.answer(no_merge, ids, pv), pipe.answer(pipe.encode_baseline, ids, pv))
+        print(f"[{'ok' if ok else 'FAIL'}] {n}: {apt32[target].shape[0]} tokens, same answer in fp16 = {same}")
+        print(f"   {'min cosine per token, after block':<36}" + "".join(f"{h:>8}" for h in show) + f"   (LLaVA uses {target})")
+        for label, a, b in [("APT fp32   vs LLaVA fp32", apt32, hf32),
+                            ("APT fp16   vs LLaVA fp32", apt16, hf32),
+                            ("LLaVA fp16 vs LLaVA fp32", hf16, hf32)]:
+            print(f"   {label:<36}" + "".join(f"{min_cos(a[h], b[h]):>8.4f}" for h in show))
+    del vision32, net32
+    torch.cuda.empty_cache()
+    assert all_ok, "APT with merging off does not reproduce LLaVA's vision features in fp32"
 
     # TTFT.
     print(f"\n=== TTFT: {args.warmup} warm-up + {args.repeats} timed runs per image, median reported ===")

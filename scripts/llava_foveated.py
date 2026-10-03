@@ -13,6 +13,7 @@ Usage (Colab):  python scripts/llava_foveated.py [--a 40] [--fov 110] [--num-sca
                 python scripts/llava_foveated.py --image-dir uploads   # your own images instead of the COCO samples
 """
 import argparse
+import json
 import os
 import sys
 
@@ -36,6 +37,25 @@ PROMPTS = {
 OUT_DIR = "outputs/llava_foveated"
 
 
+def load_gazes(path):
+    """Gaze points from a JSON file: {image name or "*": {label: [u, v], ...}}.
+    u, v in [0, 1] of the 336x336 crop LLaVA sees (u to the right, v down). "*" applies to images
+    without their own entry; images with neither use the default centre / corner / right."""
+    if path is None:
+        return {"*": GAZES}
+    with open(path) as f:
+        spec = json.load(f)
+    for name, gazes in spec.items():
+        assert isinstance(gazes, dict) and gazes, f"{name}: expected {{label: [u, v]}}"
+        for label, uv in gazes.items():
+            assert len(uv) == 2 and all(0 <= c <= 1 for c in uv), f"{name}/{label}: u, v must be in [0, 1], got {uv}"
+    return spec
+
+
+def gazes_for(spec, name):
+    return {g: tuple(uv) for g, uv in spec.get(name, spec.get("*", GAZES)).items()}
+
+
 def load_image_dir(path):
     """All images in a folder, by file name (without extension). LLaVA's processor resizes and centre-crops them."""
     exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif")
@@ -57,6 +77,7 @@ def main():
     ap.add_argument("--fov", type=float, default=110.0, help="horizontal field of view of the images, degrees")
     ap.add_argument("--max-new-tokens", type=int, default=60)
     ap.add_argument("--image-dir", default=None, help="folder of your own images (default: built-in COCO samples)")
+    ap.add_argument("--gazes", default=None, help="JSON file of gaze points (see load_gazes); default: centre, corner, right")
     args = ap.parse_args()
     device = "cuda"
 
@@ -74,6 +95,9 @@ def main():
         return lambda pv: pipe.encode_apt(net, tok, pv, input_dict=tok(pv, [gaze]))
 
     images = load_image_dir(args.image_dir) if args.image_dir else load_images()
+    gaze_spec = load_gazes(args.gazes)
+    unknown = [k for k in gaze_spec if k != "*" and k not in images]
+    assert not unknown, f"gaze entries for unknown images {unknown}; images are {list(images)}"
     names = list(images)
     inputs = {}
     for n in names:
@@ -89,46 +113,46 @@ def main():
     for n in names:
         _, pv = inputs[n, "describe"]
         with torch.inference_mode():
-            a = pipe.encode_apt(net, tok_off, pv, input_dict=tok_off(pv, [GAZES["centre"]])).float()
+            a = pipe.encode_apt(net, tok_off, pv, input_dict=tok_off(pv, [(0.5, 0.5)])).float()
             b = pipe.encode_baseline(pv).float()
         cos = F.cosine_similarity(a, b, dim=-1)
         print(f"  {n:<20} tokens {a.shape[0]} vs {b.shape[0]}   token cosine mean {cos.mean():.4f}, min {cos.min():.4f}")
         assert a.shape == b.shape and cos.mean() > 0.95, "foveated path with foveation off does not match LLaVA"
 
-    # Token counts per gaze (geometry only: identical for every image).
-    counts = {}
-    with torch.inference_mode():
-        _, pv = inputs[names[0], "describe"]
-        for g, gaze in GAZES.items():
-            layout = layout_from_input_dict(tok(pv, [gaze]), cfg)[0]
-            counts[g] = [sum(1 for *_, s in layout if s == size) for size in cfg.sizes]
-    print("\nImage tokens: baseline 576; foveated " + ", ".join(
-        f"{g} {sum(c)} [{'/'.join(map(str, c))}]" for g, c in counts.items()) + f"  (per size {cfg.sizes} px)")
-
-    # Answers.
+    # Answers, per image at its own gaze points.
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"\n=== Answers (greedy, max {args.max_new_tokens} new tokens) ===")
     for n in names:
+        gazes = gazes_for(gaze_spec, n)
+        _, pv = inputs[n, "describe"]
+        with torch.inference_mode():
+            layouts = {g: layout_from_input_dict(tok(pv, [gaze]), cfg)[0] for g, gaze in gazes.items()}
+        counts = {g: [sum(1 for *_, s in l if s == size) for size in cfg.sizes] for g, l in layouts.items()}
         print(f"\n### {n}")
+        print("  image tokens: baseline 576; " + ", ".join(
+            f"{g} at (u={u:.2f}, v={v:.2f}) -> {sum(counts[g])} [" + "/".join(map(str, counts[g])) + "]"
+            for g, (u, v) in gazes.items()) + f"  (per size {cfg.sizes} px)")
         for p in PROMPTS:
             ids, pv = inputs[n, p]
             print(f"  [{p}]")
             rows = [("baseline (576)", pipe.encode_baseline)]
-            rows += [(f"gaze {g} ({sum(counts[g])})", foveated(gaze)) for g, gaze in GAZES.items()]
+            rows += [(f"gaze {g} ({sum(counts[g])})", foveated(gaze)) for g, gaze in gazes.items()]
+            width = max(len(label) for label, _ in rows) + 2
             for label, encode in rows:
                 out = pipe.answer(encode, ids, pv, max_new_tokens=args.max_new_tokens)
                 text = processor.decode(out, skip_special_tokens=True).strip().replace("\n", " ")
-                print(f"    {label:<20} {text}")
+                print(f"    {label:<{width}}{text}")
 
         # What the model was given at each gaze.
         _, pv = inputs[n, "describe"]
         shown = Image.fromarray((pv[0].float().cpu() * torch.tensor(CLIP_STD).view(3, 1, 1)
                                  + torch.tensor(CLIP_MEAN).view(3, 1, 1)).clamp(0, 1).mul(255).byte()
                                 .permute(1, 2, 0).numpy())
-        with torch.inference_mode():
-            panels = [overlay(shown, cfg, gaze, layout_from_input_dict(tok(pv, [gaze]), cfg)[0]) for gaze in GAZES.values()]
+        panels = [overlay(shown, cfg, gaze, layouts[g]) for g, gaze in gazes.items()]
         hstack(panels).save(os.path.join(OUT_DIR, f"{n}.png"))
-    print(f"\nSaved overlays to {OUT_DIR}/ (panels: {', '.join(GAZES)})")
+        with open(os.path.join(OUT_DIR, f"{n}.gazes.txt"), "w") as f:
+            f.write(", ".join(gazes))
+    print(f"\nSaved overlays to {OUT_DIR}/ (one panel per gaze, in the order listed above)")
 
 
 if __name__ == "__main__":

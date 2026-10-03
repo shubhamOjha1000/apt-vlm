@@ -10,6 +10,7 @@ Before that, a check: with the rings pushed to infinity (every patch 14 px) the 
 LLaVA's own image features.
 
 Usage (Colab):  python scripts/llava_foveated.py [--a 40] [--fov 110] [--num-scales 3] [--max-new-tokens 60]
+                python scripts/llava_foveated.py --image-dir uploads   # your own images instead of the COCO samples
 """
 import argparse
 import os
@@ -35,6 +36,19 @@ PROMPTS = {
 OUT_DIR = "outputs/llava_foveated"
 
 
+def load_image_dir(path):
+    """All images in a folder, by file name (without extension). LLaVA's processor resizes and centre-crops them."""
+    exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif")
+    try:  # iPhone / Mac photos are often HEIC
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except ImportError:
+        pass
+    files = sorted(f for f in os.listdir(path) if f.lower().endswith(exts))
+    assert files, f"no images ({', '.join(exts)}) found in {path}"
+    return {os.path.splitext(f)[0]: Image.open(os.path.join(path, f)).convert("RGB") for f in files}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--load-4bit", action="store_true")
@@ -42,6 +56,7 @@ def main():
     ap.add_argument("--a", type=float, default=40.0)
     ap.add_argument("--fov", type=float, default=110.0, help="horizontal field of view of the images, degrees")
     ap.add_argument("--max-new-tokens", type=int, default=60)
+    ap.add_argument("--image-dir", default=None, help="folder of your own images (default: built-in COCO samples)")
     args = ap.parse_args()
     device = "cuda"
 
@@ -58,7 +73,7 @@ def main():
     def foveated(gaze):
         return lambda pv: pipe.encode_apt(net, tok, pv, input_dict=tok(pv, [gaze]))
 
-    images = load_images()
+    images = load_image_dir(args.image_dir) if args.image_dir else load_images()
     names = list(images)
     inputs = {}
     for n in names:

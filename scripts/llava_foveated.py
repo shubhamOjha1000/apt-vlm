@@ -71,7 +71,7 @@ def load_image_dir(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--load-4bit", action="store_true")
+    ap.add_argument("--load-4bit", action="store_true", help="4-bit LLM, only for GPUs under 20 GB (default: all fp16)")
     ap.add_argument("--num-scales", type=int, default=3)
     ap.add_argument("--a", type=float, default=40.0)
     ap.add_argument("--fov", type=float, default=110.0, help="horizontal field of view of the images, degrees")
@@ -81,7 +81,7 @@ def main():
     args = ap.parse_args()
     device = "cuda"
 
-    model, processor, pipe = load_llava(args.load_4bit, device)
+    model, processor, pipe = load_llava(args.load_4bit, device, auto_4bit=False)  # fp16 everywhere unless --load-4bit
 
     # Foveated encoder: APT ViT carrying LLaVA's vision weights; layout from gaze (Steps 1-3).
     net = apt_from_hf_clip(pipe.vision, args.num_scales, [0.5] * (args.num_scales - 1))

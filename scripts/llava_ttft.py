@@ -206,12 +206,17 @@ def raster_order(d, tokenizer):
     return torch.cat(keys).argsort()
 
 
-def load_llava(load_4bit=False, device="cuda"):
+def load_llava(load_4bit=False, device="cuda", auto_4bit=True):
     """LLaVA-1.5-7B (eager attention) + processor + Pipeline whose vision encoder is full fp16 CLIP.
-    The LLM is 4-bit if asked or if the GPU has < 20 GB."""
+    The LLM is 4-bit if asked, or (auto_4bit) if the GPU has < 20 GB. With auto_4bit=False and
+    load_4bit=False everything is fp16 and a too-small GPU is an error."""
     assert torch.cuda.is_available(), "needs a GPU runtime"
     gpu = torch.cuda.get_device_properties(0)
-    load_4bit = load_4bit or gpu.total_memory < 20 * 2 ** 30
+    small = gpu.total_memory < 20 * 2 ** 30
+    if small and not (load_4bit or auto_4bit):
+        raise RuntimeError(f"{gpu.name} has {gpu.total_memory / 2 ** 30:.0f} GB; LLaVA-7B in fp16 needs ~16 GB "
+                           "plus activations. Use an A100 or L4 runtime (or pass --load-4bit).")
+    load_4bit = load_4bit or (auto_4bit and small)
     print(f"GPU={gpu.name} ({gpu.total_memory / 2 ** 30:.0f} GB)  LLM={'4-bit' if load_4bit else 'fp16'}  "
           f"attention=eager (LLaVA) / {vit_components.ATTN_IMPL} (APT)  "
           f"torch={torch.__version__} transformers={transformers.__version__} timm={timm.__version__}")
@@ -236,6 +241,12 @@ def load_llava(load_4bit=False, device="cuda"):
         pipe.vision = CLIPVisionModel.from_pretrained(
             CLIP_ID, torch_dtype=torch.float16, attn_implementation="eager").to(device).eval()
         assert is_plain_fp16(pipe.vision)
+
+    report = {"vision encoder": pipe.vision, "projector": pipe.projector,
+              "decoder (LLM)": part(model, "language_model"), "lm_head": model.get_output_embeddings()}
+    print("precision: " + ", ".join(f"{k} {'fp16' if is_plain_fp16(m) else 'QUANTIZED/mixed'}" for k, m in report.items()))
+    if not load_4bit:
+        assert all(is_plain_fp16(m) for m in report.values()), "expected every part in plain fp16"
     return model, processor, pipe
 
 
